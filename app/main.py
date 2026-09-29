@@ -1,4 +1,4 @@
-"""FastAPI 接口：池状态/历史版本查询、两版本地址用途比较、预演与原子提交、部分回收、整批迁移、保留区替换与已分配地址的历史快照恢复。"""
+"""FastAPI 接口：池状态/历史版本查询、两版本地址用途比较、预演与原子提交、部分回收、整批迁移、保留区替换、保留区调整与已分配地址的历史快照恢复。"""
 from __future__ import annotations
 
 import ipaddress
@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .allocator import CidrAllocationSolver, InfeasibleError
 from .config import settings
@@ -33,11 +33,12 @@ app = FastAPI(
     title="内网 CIDR 批量分配 API",
     version="1.0.0",
     lifespan=lifespan,
-    description=(
-        "在“父网段 + 保留子网”的地址池内批量预演并原子提交对齐子网分配。"
-        "优化目标：先最小化分配后剩余空闲 CIDR 数量，再取按请求顺序的网络"
-        "地址序列字典序最小者。"
-    ),
+        description=(
+            "在“父网段 + 保留子网”的地址池内批量预演并原子提交对齐子网"
+            "分配，也支持在同一事务中调整保留区并迁移已分配地址。优化"
+            "目标：先最小化分配后剩余空闲 CIDR 数量，再取按请求顺序的"
+            "网络地址序列字典序最小者。"
+        ),
 )
 
 
@@ -243,6 +244,107 @@ class ReplaceReservationsResponse(BaseModel):
     free_cidrs: list[str]
 
 
+class ReservationAdjustmentItem(BaseModel):
+    from_cidr: str = Field(
+        ...,
+        description=(
+            "迁移来源规范 CIDR，必须完全由当前已分配地址覆盖。"
+        ),
+    )
+    to_cidr: str = Field(
+        ...,
+        description=(
+            "迁移目标规范 CIDR，与来源地址族、前缀长度相同；可使用本批"
+            "解除的旧保留地址，但不得占用未迁移的已分配地址或新保留地址。"
+        ),
+    )
+
+    @field_validator("from_cidr", "to_cidr")
+    @classmethod
+    def _validate_cidr(cls, raw: str) -> str:
+        # strict=True：主机位非零的非对齐写法直接 422，不静默改写成网络地址。
+        return str(ipaddress.ip_network(raw, strict=True))
+
+
+class AdjustReservationsRequest(BaseModel):
+    pool_version: int = Field(..., ge=1, description="当前池版本号。")
+    desired_cidrs: list[str] = Field(
+        ...,
+        description=(
+            "保留地址的完整目标集合（而非增量）：规范 CIDR 列表，允许空列表、"
+            "相互重叠或相邻；落库时规范化为覆盖范围相同且数量最少的 CIDR。"
+        ),
+    )
+    moves: list[ReservationAdjustmentItem] = Field(
+        ...,
+        min_length=1,
+        max_length=8,
+        description=(
+            "与保留区调整同一事务内整批同时迁移的 1～8 组 "
+            "from_cidr/to_cidr。"
+        ),
+    )
+
+    @field_validator("desired_cidrs")
+    @classmethod
+    def _validate_desired_cidrs(cls, values: list[str]) -> list[str]:
+        # strict=True：主机位非零的非对齐写法直接 422，不静默改写成网络地址。
+        return [str(ipaddress.ip_network(raw, strict=True)) for raw in values]
+
+    @model_validator(mode="after")
+    def _validate_cross_fields(self) -> "AdjustReservationsRequest":
+        parsed = [
+            (
+                ipaddress.ip_network(item.from_cidr, strict=True),
+                ipaddress.ip_network(item.to_cidr, strict=True),
+            )
+            for item in self.moves
+        ]
+        for src, dst in parsed:
+            if src.version != dst.version or src.prefixlen != dst.prefixlen:
+                raise ValueError(
+                    "from_cidr and to_cidr must share the same address "
+                    "family and prefix length"
+                )
+
+        families = {src.version for src, _ in parsed}
+        if len(families) > 1:
+            raise ValueError("all moves must use the same address family")
+
+        for label, nets in (
+            ("from_cidr", [src for src, _ in parsed]),
+            ("to_cidr", [dst for _, dst in parsed]),
+        ):
+            ordered = sorted(
+                nets,
+                key=lambda n: (n.version, int(n.network_address), n.prefixlen),
+            )
+            for a, b in zip(ordered, ordered[1:]):
+                if a.version == b.version and a.overlaps(b):
+                    raise ValueError(f"{label} values contain overlapping CIDRs")
+
+        # 目标保留 CIDR 与迁移端点必须属于同一地址池的地址族。
+        desired = [
+            ipaddress.ip_network(c, strict=True) for c in self.desired_cidrs
+        ]
+        desired_families = {net.version for net in desired}
+        if desired_families and desired_families != families:
+            raise ValueError(
+                "desired reservations and moves must use the same "
+                "address family"
+            )
+        return self
+
+
+class AdjustReservationsResponse(BaseModel):
+    status: Literal["adjusted"]
+    pool_version: int
+    moves: list[ReservationAdjustmentItem]
+    reserved_cidrs: list[str]
+    allocated_cidrs: list[str]
+    free_cidrs: list[str]
+
+
 class RestoreRequest(BaseModel):
     pool_version: int = Field(
         ...,
@@ -335,9 +437,9 @@ def get_pool_version(
     返回该版本保存时的父网段、保留与已分配 CIDR，以及依据该快照计算
     的空闲 CIDR。快照只追加、从不更新：旧版本的状态不随后续写入变化。
     数据库首次升级时会给当前池版本补存基线快照，此后每次成功的提交 /
-    回收 / 迁移 / 保留区替换 / 误操作恢复都会在各自写事务内生成新版本
-    快照；失败的操作不生成版本。未知版本（含基线之前不存在的版本号）
-    返回 404。
+    回收 / 迁移 / 保留区替换 / 保留区调整 / 误操作恢复都会在各自写事务
+    内生成新版本快照；失败的操作不生成版本。未知版本（含基线之前不存在
+    的版本号）返回 404。
     """
     state = db.get_state_version(version)
     if state is None:
@@ -416,6 +518,51 @@ def replace_reservations(
         status="replaced",
         pool_version=state.version,
         reserved_cidrs=[str(n) for n in state.reserved],
+        free_cidrs=[str(n) for n in free],
+    )
+
+
+@app.post(
+    "/api/pool/reservations/adjust",
+    response_model=AdjustReservationsResponse,
+    tags=["pool"],
+)
+def adjust_reservations(
+    body: AdjustReservationsRequest, db: Database = Depends(get_db)
+) -> AdjustReservationsResponse:
+    """整体替换保留区，并在同一时刻迁移会发生冲突的已分配地址。
+
+    新保留集是 ``desired_cidrs`` 的覆盖范围；新已分配集按“旧已分配地址
+    减去全部迁移来源，再加入全部迁移目标”计算。每个来源必须完整属于旧
+    已分配地址；目标可以落在本次解除的旧保留区内，但不能落在新保留区或
+    未迁移的已分配地址上。所有校验、重写、版本自增与不可变快照写入均在
+    同一个 SQLite 事务内完成。
+    """
+    desired = tuple(
+        ipaddress.ip_network(c, strict=True) for c in body.desired_cidrs
+    )
+    moves = tuple(
+        (
+            ipaddress.ip_network(item.from_cidr, strict=True),
+            ipaddress.ip_network(item.to_cidr, strict=True),
+        )
+        for item in body.moves
+    )
+    try:
+        state = db.replace_reservations_with_relocations(
+            body.pool_version, desired, moves
+        )
+    except (ReservationInputError, RelocateInputError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    free, _ = _free_cidrs(state)
+    return AdjustReservationsResponse(
+        status="adjusted",
+        pool_version=state.version,
+        moves=body.moves,
+        reserved_cidrs=[str(n) for n in state.reserved],
+        allocated_cidrs=[str(n) for n in state.allocated],
         free_cidrs=[str(n) for n in free],
     )
 
