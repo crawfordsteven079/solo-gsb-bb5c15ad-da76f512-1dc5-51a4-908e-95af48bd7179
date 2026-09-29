@@ -1,4 +1,4 @@
-"""FastAPI 接口：池状态/历史版本查询、两版本地址用途比较、预演与原子提交、部分回收、整批迁移、保留区替换与已分配地址的历史快照恢复。"""
+"""FastAPI 接口：池状态/历史版本查询、两版本地址用途比较、预演与原子提交、部分回收、整批迁移、保留区替换、保留区调整（同步腾挪已分配地址）与已分配地址的历史快照恢复。"""
 from __future__ import annotations
 
 import ipaddress
@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 from .allocator import CidrAllocationSolver, InfeasibleError
 from .config import settings
 from .db import (
+    AdjustInputError,
     ConflictError,
     Database,
     PoolState,
@@ -183,31 +184,47 @@ class RelocateRequest(BaseModel):
     def _validate_moves(
         cls, items: list[RelocateItem]
     ) -> list[RelocateItem]:
-        parsed = [
-            (
-                ipaddress.ip_network(item.from_cidr, strict=True),
-                ipaddress.ip_network(item.to_cidr, strict=True),
-            )
-            for item in items
-        ]
-        # 同组两端：地址族与前缀长度必须一致。
-        for src, dst in parsed:
-            if src.version != dst.version or src.prefixlen != dst.prefixlen:
-                raise ValueError(
-                    "from_cidr and to_cidr must share the same address "
-                    "family and prefix length"
+        _validate_move_pairs(
+            [
+                (
+                    ipaddress.ip_network(item.from_cidr, strict=True),
+                    ipaddress.ip_network(item.to_cidr, strict=True),
                 )
-        # 各来源之间、各目标之间不得重叠（来源与来源允许相邻；目标
-        # 之间同样允许相邻——重写时会合并）。
-        for label, nets in (
-            ("from_cidr", [src for src, _ in parsed]),
-            ("to_cidr", [dst for _, dst in parsed]),
-        ):
-            ordered = sorted(nets, key=lambda n: int(n.network_address))
-            for a, b in zip(ordered, ordered[1:]):
-                if a.overlaps(b):
-                    raise ValueError(f"{label} values contain overlapping CIDRs")
+                for item in items
+            ]
+        )
         return items
+
+
+def _validate_move_pairs(
+    parsed: list[
+        tuple[ipaddress._BaseNetwork, ipaddress._BaseNetwork]
+    ],
+) -> None:
+    """整批迁移/保留区调整共用的结构性校验。
+
+    仅做与池状态无关的输入检查（违反即 422）：同组两端地址族与前缀
+    长度相同、各来源之间互不重叠、各目标之间互不重叠（相邻允许）。
+    各 CIDR 的规范性由字段级 ``strict=True`` 解析保证；同族（不同组
+    之间）与“落在父网段内”在数据库写事务内对照父网段复核。
+    """
+    # 同组两端：地址族与前缀长度必须一致。
+    for src, dst in parsed:
+        if src.version != dst.version or src.prefixlen != dst.prefixlen:
+            raise ValueError(
+                "from_cidr and to_cidr must share the same address "
+                "family and prefix length"
+            )
+    # 各来源之间、各目标之间不得重叠（来源与来源允许相邻；目标
+    # 之间同样允许相邻——重写时会合并）。
+    for label, nets in (
+        ("from_cidr", [src for src, _ in parsed]),
+        ("to_cidr", [dst for _, dst in parsed]),
+    ):
+        ordered = sorted(nets, key=lambda n: int(n.network_address))
+        for a, b in zip(ordered, ordered[1:]):
+            if a.overlaps(b):
+                raise ValueError(f"{label} values contain overlapping CIDRs")
 
 
 class RelocateResponse(BaseModel):
@@ -240,6 +257,69 @@ class ReplaceReservationsResponse(BaseModel):
     status: Literal["replaced"]
     pool_version: int
     reserved_cidrs: list[str]
+    free_cidrs: list[str]
+
+
+class AdjustReservationsRequest(BaseModel):
+    pool_version: int = Field(
+        ..., ge=1, description="当前池版本号（乐观并发控制）。"
+    )
+    desired_cidrs: list[str] = Field(
+        ...,
+        description=(
+            "保留地址的完整目标集合（而非增量）：规范 CIDR 列表，允许空"
+            "列表（清空全部保留地址）、相互重叠或相邻；落库时规范化为"
+            "覆盖范围相同且数量最少的 CIDR。"
+        ),
+    )
+    moves: list[RelocateItem] = Field(
+        ...,
+        min_length=1,
+        max_length=8,
+        description=(
+            "整批同时迁移的 1～8 组 from_cidr/to_cidr：来源必须被当前已"
+            "分配地址完整覆盖，目标与来源同族、等前缀长度，可使用本批来"
+            "源释放的地址及本次解除的旧保留地址，但不得占用未迁移的已分"
+            "配地址。"
+        ),
+    )
+
+    @field_validator("desired_cidrs")
+    @classmethod
+    def _validate_desired(cls, values: list[str]) -> list[str]:
+        # strict=True：主机位非零的非对齐写法直接 422，不静默改写成网络地址。
+        return [str(ipaddress.ip_network(raw, strict=True)) for raw in values]
+
+    @field_validator("moves")
+    @classmethod
+    def _validate_moves(
+        cls, items: list[RelocateItem]
+    ) -> list[RelocateItem]:
+        parsed = [
+            (
+                ipaddress.ip_network(item.from_cidr, strict=True),
+                ipaddress.ip_network(item.to_cidr, strict=True),
+            )
+            for item in items
+        ]
+        _validate_move_pairs(parsed)
+        # 全部来源与目标必须同族（不同组之间不得混用 IPv4/IPv6）。
+        families = {
+            net.version for pair in parsed for net in pair
+        }
+        if len(families) > 1:
+            raise ValueError(
+                "all from_cidr/to_cidr values must share the same address family"
+            )
+        return items
+
+
+class AdjustReservationsResponse(BaseModel):
+    status: Literal["adjusted"]
+    pool_version: int
+    moves: list[RelocateItem]
+    reserved_cidrs: list[str]
+    allocated_cidrs: list[str]
     free_cidrs: list[str]
 
 
@@ -335,9 +415,9 @@ def get_pool_version(
     返回该版本保存时的父网段、保留与已分配 CIDR，以及依据该快照计算
     的空闲 CIDR。快照只追加、从不更新：旧版本的状态不随后续写入变化。
     数据库首次升级时会给当前池版本补存基线快照，此后每次成功的提交 /
-    回收 / 迁移 / 保留区替换 / 误操作恢复都会在各自写事务内生成新版本
-    快照；失败的操作不生成版本。未知版本（含基线之前不存在的版本号）
-    返回 404。
+    回收 / 迁移 / 保留区替换 / 保留区调整 / 误操作恢复都会在各自写事务
+    内生成新版本快照；失败的操作不生成版本。未知版本（含基线之前不
+    存在的版本号）返回 404。
     """
     state = db.get_state_version(version)
     if state is None:
@@ -416,6 +496,60 @@ def replace_reservations(
         status="replaced",
         pool_version=state.version,
         reserved_cidrs=[str(n) for n in state.reserved],
+        free_cidrs=[str(n) for n in free],
+    )
+
+
+@app.post(
+    "/api/pool/reservations/adjust",
+    response_model=AdjustReservationsResponse,
+    tags=["pool"],
+)
+def adjust_reservations(
+    body: AdjustReservationsRequest, db: Database = Depends(get_db)
+) -> AdjustReservationsResponse:
+    """调整保留范围并同步腾挪已分配地址（单事务，原子）。
+
+    解决“待保留地址当前已分配、腾挪目标仍在旧保留区”时分步调用无法
+    完成的问题：按**同一时刻的结果**一次性计算——新保留集为
+    ``desired_cidrs`` 目标集合（允许空、重叠、相邻，折叠为最少规范
+    CIDR），新已分配集为“旧已分配 − 全部来源 + 全部目标”。
+
+    每组来源/目标须为规范 CIDR、同族且前缀长度相同（1～8 组）；各来源
+    之间、各目标之间不得重叠。来源必须被旧已分配地址完整覆盖；目标可
+    使用本批来源释放的地址，也可使用本次解除的旧保留地址，但不得占用
+    未迁移的已分配地址；最终保留集与已分配集不得相交。
+
+    版本核对、来源覆盖与全部冲突复核、保留与已分配记录重写、版本自增
+    及不可变快照追加在单个 SQLite 写事务内完成；版本过期或状态冲突
+    返回 `409 Conflict` 且池与版本不变；CIDR 非规范、越出父网段、地址
+    族或等长约束不符返回 `422 Unprocessable Entity`。
+    """
+    desired = tuple(
+        ipaddress.ip_network(c, strict=True) for c in body.desired_cidrs
+    )
+    moves = tuple(
+        (
+            ipaddress.ip_network(item.from_cidr, strict=True),
+            ipaddress.ip_network(item.to_cidr, strict=True),
+        )
+        for item in body.moves
+    )
+    try:
+        state = db.adjust_reservations(
+            body.pool_version, desired, moves
+        )
+    except AdjustInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    free, _ = _free_cidrs(state)
+    return AdjustReservationsResponse(
+        status="adjusted",
+        pool_version=state.version,
+        moves=body.moves,
+        reserved_cidrs=[str(n) for n in state.reserved],
+        allocated_cidrs=[str(n) for n in state.allocated],
         free_cidrs=[str(n) for n in free],
     )
 

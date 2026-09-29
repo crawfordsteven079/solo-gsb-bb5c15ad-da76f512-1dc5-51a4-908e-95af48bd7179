@@ -19,13 +19,19 @@
   历史快照存在性检查 + 快照已分配地址与当前保留区相交复核 + 已分配
   集重写 + 版本自增”：仅把已分配地址恢复为历史快照的地址集合，当前
   保留区保持原样；任何一步失败即整体回滚，历史快照本身从不改写。
+* 保留区调整接口（``adjust_reservations``）在单条 ``BEGIN IMMEDIATE``
+  事务内完成“版本检查 + 来源覆盖复核 + 新保留/迁移目标冲突复核 +
+  保留集与已分配集同时重写 + 版本自增”：新保留集取目标集合，新已分配
+  集为旧已分配减去全部来源再并入全部目标，目标可使用本次解除的旧保留
+  地址与本批来源释放的地址；按同一时刻的结果计算，任一步失败即整体
+  回滚。
 
 历史版本
 ========
 * 每次成功的写事务（分配提交 / 部分回收 / 整批迁移 / 保留区替换 /
-  误操作恢复）在**同一事务内**为自增后的新版本追加一份不可变快照
-  （父网段、保留与已分配 CIDR）；失败的操作整体回滚，不会留下任何
-  版本快照；
+  误操作恢复 / 保留区调整）在**同一事务内**为自增后的新版本追加一份
+  不可变快照（父网段、保留与已分配 CIDR）；失败的操作整体回滚，不会
+  留下任何版本快照；
 * 旧库**首次升级**（快照表尚不存在/为空）时，在初始化阶段给当前池
   版本补存一份基线快照，此后该版本及后续版本均可查询；
 * 快照只追加、从不更新：旧版本的状态不随后续写入变化，查询时依据
@@ -128,6 +134,12 @@ class ReservationInputError(Exception):
 
 class RelocateInputError(Exception):
     """迁移端点非法：来源/目标越出父网段或地址族与父网段不一致（HTTP 422）。"""
+
+
+class AdjustInputError(Exception):
+    """保留区调整输入非法：来源/目标/目标保留越出父网段或地址族与父网段
+    不一致（HTTP 422）。等长同族、非规范、互斥等结构性校验由接口层
+    pydantic 模型先行完成。"""
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -984,6 +996,208 @@ class Database:
             except sqlite3.Error as exc:
                 conn.rollback()
                 raise ConflictError(f"restore failed: {exc}") from exc
+        return state
+
+    # -- 保留区调整 + 已分配地址整批迁移（单事务）---------------------------
+
+    def adjust_reservations(
+        self,
+        expected_version: int,
+        desired: tuple[ipaddress._BaseNetwork, ...],
+        moves: tuple[
+            tuple[ipaddress._BaseNetwork, ipaddress._BaseNetwork], ...
+        ],
+    ) -> PoolState:
+        """**同时**替换保留区并整批迁移已分配地址（保留区调整）。
+
+        针对“待保留地址当前已分配、腾挪目标仍在旧保留区”导致分步调用
+        无法完成的场景，按**同一时刻的结果**一次性计算：
+
+        * 新保留集 = ``desired`` 覆盖范围折叠出的最少规范 CIDR（允许为空、
+          重叠、相邻）；
+        * 新已分配集 = （旧已分配 − 全部来源）∪ 全部目标。
+
+        调用前由接口层保证（非法输入对应 HTTP 422）：每个来源/目标均为
+        规范 CIDR、同组两端地址族与前缀长度相同、各来源之间互不重叠、各
+        目标之间互不重叠。本方法在事务内复核的语义约束（违反即
+        ``ConflictError``，HTTP 409）：
+
+        * 每个来源必须被**旧已分配地址**完整覆盖；
+        * 目标可使用本批来源释放的地址，也可使用**本次解除的旧保留地址**，
+          但不得占用未被本批迁移的已分配地址；
+        * 新保留集与新已分配集不得相交（等价于：新保留不压住未迁移的已
+          分配地址、也不压住任一目标）。
+
+        在单条 ``BEGIN IMMEDIATE`` 事务内完成：父网段/地址族校验（非法
+        输入抛 ``AdjustInputError``，HTTP 422）、版本检查、来源覆盖与全部
+        冲突复核、保留与已分配记录的整体重写、版本自增与新快照追加。任何
+        一步失败即整体回滚，池状态与版本不发生任何改动。返回写事务内读取
+        的新状态。
+        """
+        with self._conn() as conn:
+            try:
+                # 立即获取写锁，与并发的其它写操作互斥。
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT parent_cidr, version FROM pool_meta WHERE id = 1"
+                ).fetchone()
+                parent = ipaddress.ip_network(row["parent_cidr"], strict=True)
+
+                # 输入校验：目标保留、来源与目标都必须同族且完全落在父网段
+                # 内（非法输入，非状态冲突）。
+                for net in (*desired, *(n for pair in moves for n in pair)):
+                    if net.version != parent.version or not net.subnet_of(
+                        parent
+                    ):
+                        conn.rollback()
+                        raise AdjustInputError(
+                            f"adjust CIDR {net} is outside of pool {parent}"
+                        )
+
+                current_version = row["version"]
+                if current_version != expected_version:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"pool version changed: expected {expected_version}, "
+                        f"current {current_version}"
+                    )
+
+                rows = conn.execute(
+                    "SELECT cidr, kind FROM subnets"
+                ).fetchall()
+                old_reserved = [
+                    ipaddress.ip_network(r["cidr"], strict=True)
+                    for r in rows
+                    if r["kind"] == "reserved"
+                ]
+                old_allocated = [
+                    ipaddress.ip_network(r["cidr"], strict=True)
+                    for r in rows
+                    if r["kind"] == "allocated"
+                ]
+
+                sources = [src for src, _ in moves]
+                targets = [dst for _, dst in moves]
+
+                # 新保留区间：合并相交/相邻区间（允许空、重叠、相邻输入）。
+                desired_ranges = _collapse_ranges(
+                    [_network_bounds(net) for net in desired]
+                )
+                allocated_ranges = _collapse_ranges(
+                    [_network_bounds(net) for net in old_allocated]
+                )
+                source_ranges = _collapse_ranges(
+                    [_network_bounds(net) for net in sources]
+                )
+
+                # 覆盖性复核：每个来源必须被旧已分配地址完整覆盖。
+                for src in sources:
+                    if _subtract_ranges(
+                        _network_bounds(src), allocated_ranges
+                    ):
+                        conn.rollback()
+                        raise ConflictError(
+                            f"adjust source {src} is not fully covered by "
+                            f"allocated addresses"
+                        )
+
+                # 未迁移的已分配区间：旧已分配合并集扣除全部来源。
+                remaining_ranges: list[tuple[int, int]] = []
+                for bounds in allocated_ranges:
+                    remaining_ranges.extend(
+                        _subtract_ranges(bounds, source_ranges)
+                    )
+                remaining_ranges = _collapse_ranges(remaining_ranges)
+
+                # 冲突复核（一）：新保留集不得压住未迁移的已分配地址。
+                for d_start, d_end in desired_ranges:
+                    hits = [
+                        (r_start, r_end)
+                        for r_start, r_end in remaining_ranges
+                        if d_start <= r_end and r_start <= d_end
+                    ]
+                    if hits:
+                        conn.rollback()
+                        raise ConflictError(
+                            f"desired reservations overlap allocated addresses "
+                            f"that are not being migrated"
+                        )
+
+                # 冲突复核（二）：目标不得占用未迁移的已分配地址。目标可
+                # 使用本批来源释放的地址，也可使用本次解除的旧保留地址
+                # （目标落在旧保留区是本接口要解决的核心场景）。
+                for dst in targets:
+                    d_start, d_end = _network_bounds(dst)
+                    if any(
+                        d_start <= r_end and r_start <= d_end
+                        for r_start, r_end in remaining_ranges
+                    ):
+                        conn.rollback()
+                        raise ConflictError(
+                            f"adjust target {dst} overlaps allocated address "
+                            f"that is not being migrated"
+                        )
+
+                # 新已分配区间 = 未迁移已分配 ∪ 全部目标。
+                new_allocated_ranges = _collapse_ranges(
+                    remaining_ranges
+                    + [_network_bounds(net) for net in targets]
+                )
+
+                # 冲突复核（三）：最终保留集与已分配集不得相交。该校验在
+                # “目标可能压住新保留地址”这一情形上补充上面两项检查
+                # （新保留可使用本次解除的旧保留地址，故不与旧保留比较）。
+                for d_start, d_end in desired_ranges:
+                    if any(
+                        d_start <= a_end and a_start <= d_end
+                        for a_start, a_end in new_allocated_ranges
+                    ):
+                        conn.rollback()
+                        raise ConflictError(
+                            f"desired reservations overlap migrated target "
+                            f"addresses"
+                        )
+
+                # 折叠为覆盖范围相同且数量最少的规范 CIDR。
+                new_reserved = [
+                    ipaddress.ip_network((s, p), strict=True)
+                    for s, p in _ranges_to_cidrs(
+                        parent.max_prefixlen, desired_ranges
+                    )
+                ]
+                new_allocated = [
+                    ipaddress.ip_network((s, p), strict=True)
+                    for s, p in _ranges_to_cidrs(
+                        parent.max_prefixlen, new_allocated_ranges
+                    )
+                ]
+
+                # 整体重写保留与已分配记录。
+                conn.execute("DELETE FROM subnets")
+                conn.executemany(
+                    "INSERT INTO subnets (cidr, kind) VALUES (?, 'reserved')",
+                    [(str(net),) for net in new_reserved],
+                )
+                conn.executemany(
+                    "INSERT INTO subnets (cidr, kind) "
+                    "VALUES (?, 'allocated')",
+                    [(str(net),) for net in new_allocated],
+                )
+                conn.execute(
+                    "UPDATE pool_meta SET version = version + 1 WHERE id = 1"
+                )
+                # 与其它写操作相同：在同一写事务内读取调整后的状态。
+                state = self._load_state(conn)
+                # 新版本快照与本次写入同一事务追加；失败整体回滚，失败
+                # 操作不生成任何版本。
+                self._insert_snapshot(conn, state)
+                conn.commit()
+                self._after_commit(conn)
+            except (ConflictError, AdjustInputError):
+                raise
+            except sqlite3.Error as exc:
+                conn.rollback()
+                raise ConflictError(f"adjust reservations failed: {exc}") from exc
         return state
 
 
